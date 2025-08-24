@@ -3,3 +3,5 @@ uvicorn
 aiohttp
 beautifulsoup4
 lxml
+selenium
+chromedriver-autoinstaller
