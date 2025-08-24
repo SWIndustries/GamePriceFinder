@@ -5,12 +5,14 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 import re
 import os
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+import chromedriver_autoinstaller
 
 app = FastAPI()
 
 # ---------- FRONTEND ----------
-HTML_PAGE = """
-<!DOCTYPE html>
+HTML_PAGE = """<!DOCTYPE html>
 <html>
 <head>
   <title>PC Game Key Price Finder</title>
@@ -50,8 +52,7 @@ HTML_PAGE = """
     }
   </script>
 </body>
-</html>
-"""
+</html>"""
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -60,7 +61,7 @@ async def home():
 # ---------- HELPERS ----------
 async def fetch_html(session, url):
     try:
-        async with session.get(url, headers={"User-Agent":"Mozilla/5.0"}) as r:
+        async with session.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10) as r:
             return await r.text()
     except Exception:
         return ""
@@ -69,7 +70,7 @@ def extract_price(text):
     m = re.search(r"(\d+[.,]?\d*)", text.replace(",", "."))
     return float(m.group(1)) if m else 99999
 
-# ---------- CRAWLERS ----------
+# ---------- STATIC SITE CRAWLERS ----------
 async def crawl_cdkeys(session, game):
     url = f"https://www.cdkeys.com/catalogsearch/result/?q={game}"
     html = await fetch_html(session, url)
@@ -104,72 +105,92 @@ async def crawl_fanatical(session, game):
             })
     return results
 
-async def crawl_instantgaming(session, game):
-    url = f"https://www.instant-gaming.com/en/search/?query={game}"
-    html = await fetch_html(session, url)
-    soup = BeautifulSoup(html, "lxml")
-    results = []
-    for card in soup.select(".item"):
-        title = card.select_one(".title")
-        price = card.select_one(".price")
-        link = card.get("href")
-        if title and price and link:
-            results.append({
-                "store":"Instant Gaming",
-                "title":title.text.strip(),
-                "price":price.text.strip(),
-                "url":"https://www.instant-gaming.com" + link
-            })
-    return results
+# ---------- DYNAMIC SITE CRAWLERS USING SELENIUM ----------
+def selenium_driver():
+    chromedriver_autoinstaller.install()
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    driver = webdriver.Chrome(options=chrome_options)
+    return driver
 
-async def crawl_g2a(session, game):
-    url = f"https://www.g2a.com/search?query={game}"
-    html = await fetch_html(session, url)
-    soup = BeautifulSoup(html, "lxml")
-    results = []
-    for card in soup.select("a.sc-1j3ie3s-0"):
-        title = card.select_one("h3")
-        price = card.select_one(".sc-1x6crnh-2")
-        if title and price:
-            results.append({
-                "store":"G2A",
-                "title":title.text.strip(),
-                "price":price.text.strip(),
-                "url":"https://www.g2a.com" + card.get("href")
-            })
-    return results
+async def crawl_dynamic_site(func, game):
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(loop.run_in_executor(None, func, game), timeout=15)
+    except asyncio.TimeoutError:
+        return []
 
-async def crawl_gmg(session, game):
-    url = f"https://www.greenmangaming.com/search/{game}/"
-    html = await fetch_html(session, url)
-    soup = BeautifulSoup(html, "lxml")
-    results = []
-    for card in soup.select(".product"):
-        title = card.select_one(".product-title")
-        price = card.select_one(".product-price")
-        link = card.select_one("a")
-        if title and price and link:
-            results.append({
-                "store":"GreenManGaming",
-                "title":title.text.strip(),
-                "price":price.text.strip(),
-                "url":"https://www.greenmangaming.com" + link.get("href")
-            })
-    return results
+def crawl_instantgaming(game):
+    driver = selenium_driver()
+    try:
+        driver.get(f"https://www.instant-gaming.com/en/search/?query={game}")
+        results = []
+        items = driver.find_elements_by_css_selector(".item")
+        for card in items[:10]:  # limit top 10
+            try:
+                title = card.find_element_by_css_selector(".title").text
+                price = card.find_element_by_css_selector(".price").text
+                link = card.get_attribute("href")
+                results.append({"store":"Instant Gaming","title":title,"price":price,"url":link})
+            except: pass
+        return results
+    finally:
+        driver.quit()
+
+def crawl_g2a(game):
+    driver = selenium_driver()
+    try:
+        driver.get(f"https://www.g2a.com/search?query={game}")
+        results = []
+        items = driver.find_elements_by_css_selector("a.sc-1j3ie3s-0")
+        for card in items[:10]:
+            try:
+                title = card.find_element_by_css_selector("h3").text
+                price = card.find_element_by_css_selector(".sc-1x6crnh-2").text
+                link = card.get_attribute("href")
+                results.append({"store":"G2A","title":title,"price":price,"url":link})
+            except: pass
+        return results
+    finally:
+        driver.quit()
+
+def crawl_gmg(game):
+    driver = selenium_driver()
+    try:
+        driver.get(f"https://www.greenmangaming.com/search/{game}/")
+        results = []
+        items = driver.find_elements_by_css_selector(".product")[:10]
+        for card in items:
+            try:
+                title = card.find_element_by_css_selector(".product-title").text
+                price = card.find_element_by_css_selector(".product-price").text
+                link = card.find_element_by_css_selector("a").get_attribute("href")
+                results.append({"store":"GreenManGaming","title":title,"price":price,"url":link})
+            except: pass
+        return results
+    finally:
+        driver.quit()
 
 # ---------- SEARCH ENDPOINT ----------
 @app.get("/search", response_class=JSONResponse)
 async def search(q: str):
     async with aiohttp.ClientSession() as session:
         tasks = [
-            crawl_cdkeys(session, q),
-            crawl_fanatical(session, q),
-            crawl_instantgaming(session, q),
-            crawl_g2a(session, q),
-            crawl_gmg(session, q),
+            asyncio.wait_for(crawl_cdkeys(session, q), timeout=10),
+            asyncio.wait_for(crawl_fanatical(session, q), timeout=10),
+            crawl_dynamic_site(crawl_instantgaming, q),
+            crawl_dynamic_site(crawl_g2a, q),
+            crawl_dynamic_site(crawl_gmg, q)
         ]
-        results = await asyncio.gather(*tasks)
-    flat = [item for sublist in results for item in sublist]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    flat = []
+    for res in results:
+        if isinstance(res, list):
+            flat.extend(res)
     flat.sort(key=lambda x: extract_price(x["price"]))
     return flat
 
